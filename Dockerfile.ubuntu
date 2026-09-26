@@ -1,0 +1,112 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS source
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gpgv \
+ && rm -rf /var/lib/apt/lists/*
+ARG VERSION
+ARG SOURCE_SHA256
+ADD --checksum=sha256:${SOURCE_SHA256} https://github.com/RsyncProject/rsync/releases/download/v${VERSION}/rsync-${VERSION}.tar.gz /src/
+ADD https://github.com/RsyncProject/rsync/releases/download/v${VERSION}/rsync-${VERSION}.tar.gz.asc /src/
+# rsync release signing keys: Andrew Tridgell, fingerprint 9FEF 112D CE19 A0DC 7E88 2CB8 1BB2 4997 A853 5F6F,
+# and Zen Dodd, fingerprint C0E1 0545 0570 4F75 7D92 5AB2 6A64 E8AA 2EFB CF5D
+COPY keys/rsync-release.gpg /tmp/rsync-release.gpg
+WORKDIR /src
+RUN set -eu; \
+    gpgv --keyring /tmp/rsync-release.gpg "rsync-${VERSION}.tar.gz.asc" "rsync-${VERSION}.tar.gz"; \
+    mkdir rsync; \
+    tar -xzf "rsync-${VERSION}.tar.gz" -C rsync --strip-components=1
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+# The base image's packages are recorded before anything is installed, so that
+# runtime-deps can leave them out. Every image that installs runtime-deps is
+# built on the same base.
+RUN dpkg-query -W -f '${Package}\n' | sort -u > /tmp/base-packages \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      libacl1-dev \
+      libidn2-dev \
+      liblz4-dev \
+      libpopt-dev \
+      libssl-dev \
+      libxxhash-dev \
+      libzstd-dev \
+ && rm -rf /var/lib/apt/lists/*
+COPY --link --from=source /src/rsync /src/rsync
+WORKDIR /src/rsync
+ARG JOBS
+# configure switches to the bundled popt, without failing, when it cannot use
+# the distro's. The license files below assume the distro's popt and rsync's
+# own zlib, so both are checked.
+RUN set -eu; \
+    ./configure \
+      --prefix=/usr/local \
+      --disable-md2man \
+      --enable-acl-support \
+      --enable-xattr-support \
+      --with-included-zlib \
+      --without-included-popt; \
+    if grep -q '^#define EXTERNAL_ZLIB' config.h; then echo "built against the system zlib" >&2; exit 1; fi; \
+    make -j"${JOBS:-$(nproc)}"; \
+    if [ -e popt/popt.o ]; then echo "built the bundled popt" >&2; exit 1; fi; \
+    make install DESTDIR=/out; \
+    rm -f /out/usr/local/bin/rsync-ssl; \
+    rm -rf /out/usr/local/share/man; \
+    strip --strip-unneeded /out/usr/local/bin/rsync
+
+ARG BASE_IMAGE
+ARG VERSION
+# runtime-deps lists the packages that own the libraries the binaries load,
+# minus the base image's packages, plus the packages in runtime-deps.ubuntu.
+RUN --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    set -eu; \
+    meta=/out/usr/local/share/randomcontainers/rsync; \
+    mkdir -p "$meta/licenses"; \
+    cp COPYING "$meta/licenses/"; \
+    sed -n '1,/\*\//p' zlib/zlib.h > "$meta/licenses/COPYING.zlib"; \
+    grep -q 'Permission is granted to anyone' "$meta/licenses/COPYING.zlib"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/RsyncProject/rsync/releases/download/v${VERSION}/rsync-${VERSION}.tar.gz" \
+      "https://github.com/RsyncProject/rsync/releases/download/v${VERSION}/rsync-${VERSION}.tar.gz.asc" \
+      "https://github.com/randomcontainers/rsync/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    /out/usr/local/bin/rsync --version > /tmp/rsync-version; \
+    head -n 1 /tmp/rsync-version | grep -Fq "rsync  version ${VERSION}  protocol version "; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      sed -n 's/^  \$ \(\.\/configure.*\)/\1/p' config.log; \
+      cat /tmp/rsync-version; \
+    } > "$meta/buildinfo"; \
+    find /out/usr/local -type f \( -perm -u+x -o -name '*.so*' \) -print0 \
+      | xargs -0 env LD_LIBRARY_PATH=/out/usr/local/lib ldd > /tmp/ldd 2>&1 || true; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    awk '$2 == "=>" && $3 ~ /^\// && $3 !~ /^\/out\// { print $3 }' /tmp/ldd | sort -u > /tmp/libs; \
+    test -s /tmp/libs; \
+    while read -r lib; do \
+      real="$(readlink -f "$lib")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | sort -u | comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+COPY --link --from=build /out/usr/local/ /usr/local/
+RUN set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /usr/local/share/randomcontainers/rsync/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -m 1777 /work /cache
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "rsync"]
+CMD ["--version"]
