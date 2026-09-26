@@ -1,0 +1,173 @@
+name: rsync
+title: rsync
+summary: Copies and synchronizes files locally, over SSH or with an rsync daemon, sending only the parts of files that changed.
+homepage: https://rsync.samba.org/
+license: GPL-3.0-or-later AND Zlib
+source-release: true
+upstream:
+  source: github-release
+  repository: RsyncProject/rsync
+  # Release tags look like v3.5.1; pre-releases (v3.3.0pre1) do not match.
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 3.5.1
+  artifact:
+    url: https://github.com/RsyncProject/rsync/releases/download/v{version}/rsync-{version}.tar.gz
+    signature: https://github.com/RsyncProject/rsync/releases/download/v{version}/rsync-{version}.tar.gz.asc
+    sha256: c55f9c9dc10fb8bec397b399a0fdded53cc9a2d8e30891bb0d63724d25c37bef
+image:
+  entrypoint: [rsync]
+  cmd: [--version]
+test:
+  - |
+    rsync --version > version.txt
+    head -n 1 version.txt | grep -Fq "rsync  version $VERSION  protocol version "
+    test ! -e /usr/local/bin/rsync-ssl
+    # -VV prints the same information as JSON, with true or false for each capability.
+    rsync -VV > version.json
+    grep -Fq "\"version\": \"$VERSION\"" version.json
+    for f in '"ACLs": true' '"xattrs": true' '"IPv6": true' '"IDN": true' '"openssl_crypto": true' \
+      '"xxh128"' '"zstd"' '"lz4"' '"zlibx"' '"sha512"'; do
+      grep -Fq "$f" version.json || { echo "rsync -VV does not list $f" >&2; exit 1; }
+    done
+  - |
+    mkdir -p local/src/sub/deeper
+    printf 'alpha\n' > local/src/a.txt
+    printf 'beta\n' > local/src/sub/b.txt
+    head -c 65536 /dev/urandom > local/src/sub/deeper/random.bin
+    printf '#!/bin/sh\n' > local/src/run.sh
+    chmod 755 local/src/run.sh
+    chmod 640 local/src/sub/b.txt
+    ln -s a.txt local/src/link
+    ln local/src/a.txt local/src/hard
+    touch -t 202001020304.05 local/src/a.txt local/src/sub/b.txt
+    rsync -aHAX local/src/ local/dst/
+    diff -r local/src local/dst
+    test "$(readlink local/dst/link)" = a.txt
+    test "$(stat -c %i local/dst/a.txt)" = "$(stat -c %i local/dst/hard)"
+    test "$(stat -c %a local/dst/run.sh)" = 755
+    test "$(stat -c %a local/dst/sub/b.txt)" = 640
+    test "$(stat -c %Y local/dst/a.txt)" = "$(stat -c %Y local/src/a.txt)"
+    test "$(stat -c %Y local/dst/sub/b.txt)" = "$(stat -c %Y local/src/sub/b.txt)"
+  - |
+    # Same size and modification time: only --checksum notices the new content.
+    mkdir -p quick/src
+    printf 'hello\n' > quick/src/same.txt
+    printf 'keep\n' > quick/src/keep.txt
+    touch -t 202001020304.05 quick/src/same.txt
+    rsync -a quick/src/ quick/dst/
+    printf 'extra\n' > quick/dst/extra.txt
+    printf 'HELLO\n' > quick/src/same.txt
+    touch -t 202001020304.05 quick/src/same.txt
+    rsync -a quick/src/ quick/dst/
+    test "$(cat quick/dst/same.txt)" = hello
+    rsync -a --checksum --delete --itemize-changes quick/src/ quick/dst/ > changes.txt
+    test "$(cat quick/dst/same.txt)" = HELLO
+    test ! -e quick/dst/extra.txt
+    grep -Eq '^>f[^ ]* same\.txt$' changes.txt
+    grep -Eq '^\*deleting +extra\.txt$' changes.txt
+    if grep -Fq keep.txt changes.txt; then cat changes.txt >&2; exit 1; fi
+  - |
+    # rsh.sh stands in for ssh: it drops the host name and runs the command
+    # rsync passes, so the client and the server both run here.
+    printf '%s\n' shift 'exec sh -c "$*"' > rsh.sh
+    rsh="sh $PWD/rsh.sh"
+    mkdir -p remote/src
+    head -c 1048576 /dev/urandom > remote/src/big.bin
+    printf 'small\n' > remote/src/small.txt
+    touch -t 202001020304.05 remote/src/big.bin
+    rsync -a -e "$rsh" remote/src/ localhost:remote/pushed/
+    diff -r remote/src remote/pushed
+    rsync -a -e "$rsh" localhost:remote/src/ remote/pulled/
+    diff -r remote/src remote/pulled
+    # After a small change in the middle, only the blocks around it are sent.
+    printf changed | dd of=remote/src/big.bin bs=1 seek=524288 conv=notrunc 2> /dev/null
+    rsync -a --stats -e "$rsh" remote/src/ localhost:remote/pushed/ > stats.txt
+    cmp remote/src/big.bin remote/pushed/big.bin
+    literal="$(sed -n 's/^Literal data: \([0-9,.]*\) bytes$/\1/p' stats.txt | tr -d ,.)"
+    matched="$(sed -n 's/^Matched data: \([0-9,.]*\) bytes$/\1/p' stats.txt | tr -d ,.)"
+    test -n "$literal"
+    test -n "$matched"
+    if [ "$literal" -ge 65536 ] || [ "$matched" -lt 900000 ]; then cat stats.txt >&2; exit 1; fi
+    rsync -az --debug=NSTR -e "$rsh" remote/src/ localhost:remote/negotiated/ > nstr.txt
+    grep -Fq 'Client negotiated checksum: xxh128' nstr.txt
+    grep -Fq 'Client negotiated compress: zstd' nstr.txt
+    for c in zstd lz4 zlibx zlib; do
+      rsync -a --compress-choice="$c" -e "$rsh" remote/src/ "localhost:remote/compress-$c/"
+      diff -r remote/src "remote/compress-$c"
+    done
+    for c in xxh128 xxh3 xxh64 md5 md4 sha1; do
+      rsync -a --checksum --checksum-choice="$c" -e "$rsh" remote/src/ "localhost:remote/checksum-$c/"
+      diff -r remote/src "remote/checksum-$c"
+    done
+  - |
+    mkdir -p daemon/data daemon/upload
+    printf 'served\n' > daemon/data/file.txt
+    head -c 200000 /dev/urandom > daemon/data/random.bin
+    printf 'alice:s3cret\n' > daemon/secrets
+    chmod 600 daemon/secrets
+    cat > daemon/rsyncd.conf <<EOF
+    use chroot = no
+    reverse lookup = no
+    log file = $PWD/daemon/rsyncd.log
+    [data]
+        path = $PWD/daemon/data
+    [upload]
+        path = $PWD/daemon/upload
+        read only = no
+    [private]
+        path = $PWD/daemon/data
+        auth users = alice
+        secrets file = $PWD/daemon/secrets
+        auth digest = sha512
+    EOF
+    # A single-use daemon started over the remote shell, as with ssh host::module.
+    printf '%s\n' shift 'exec sh -c "$*"' > rsh.sh
+    rsync -a -e "sh $PWD/rsh.sh" --rsync-path="rsync --config=$PWD/daemon/rsyncd.conf" localhost::data/ via-rsh/
+    diff -r daemon/data via-rsh
+    # A daemon listening on a TCP port, as a user other than root.
+    rsync --daemon --no-detach --config="$PWD/daemon/rsyncd.conf" --address=127.0.0.1 --port=8730 &
+    pid=$!
+    trap 'kill "$pid" 2> /dev/null || true' EXIT
+    i=0
+    until rsync rsync://127.0.0.1:8730/ > modules.txt 2> /dev/null; do
+      i=$((i + 1))
+      if [ "$i" -ge 30 ]; then cat daemon/rsyncd.log >&2 || true; exit 1; fi
+      sleep 1
+    done
+    grep -Eq '^data[[:space:]]' modules.txt
+    grep -Eq '^upload[[:space:]]' modules.txt
+    rsync -a rsync://127.0.0.1:8730/data/ from-daemon/
+    diff -r daemon/data from-daemon
+    rsync -a from-daemon/ rsync://127.0.0.1:8730/upload/
+    diff -r daemon/data daemon/upload
+    if rsync -a from-daemon/ rsync://127.0.0.1:8730/data/ 2> read-only.err; then
+      echo "the read-only module accepted an upload" >&2
+      exit 1
+    fi
+    RSYNC_PASSWORD=s3cret rsync -a rsync://alice@127.0.0.1:8730/private/ from-private/
+    diff -r daemon/data from-private
+    if RSYNC_PASSWORD=wrong rsync -a rsync://alice@127.0.0.1:8730/private/ denied/ 2> denied.err; then
+      echo "a wrong password was accepted" >&2
+      exit 1
+    fi
+    grep -Fq 'auth failed' denied.err
+  - |
+    # ssh is the default remote shell. It needs a passwd entry for the UID,
+    # which the arbitrary UID of these tests does not have, so it is not run.
+    ssh_bin="$(command -v ssh)"
+    ldd "$ssh_bin" > ssh-ldd.txt 2>&1 || true
+    if grep -Eq 'not found|Error loading shared library|Error relocating' ssh-ldd.txt; then
+      cat ssh-ldd.txt >&2
+      exit 1
+    fi
+examples:
+  - title: Mirror a directory, deleting files that are gone from the source
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/rsync -a --delete photos/ photos-backup/
+  - title: Show what would change without copying anything
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/rsync -a --delete --dry-run --itemize-changes photos/ photos-backup/
+  - title: Copy a directory to a server over SSH (as UID 1000, see the README)
+    command: docker run --rm --user 1000:1000 -v "$PWD:/work" -v "$HOME/.ssh:/ssh:ro" ghcr.io/randomcontainers/rsync -a -e "ssh -i /ssh/id_ed25519 -o UserKnownHostsFile=/ssh/known_hosts" site/ deploy@example.com:/var/www/site/
+  - title: Serve a directory with the rsync daemon on port 873
+    command: docker run -d --user "$(id -u):$(id -g)" -p 873:8730 -v "$PWD:/work" ghcr.io/randomcontainers/rsync --daemon --no-detach --port=8730 --config=/work/rsyncd.conf
