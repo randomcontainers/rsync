@@ -11,8 +11,6 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontain
   -a --delete photos/ photos-backup/
 ```
 
-The same images can also be pulled as `randomcontainers.com/rsync`.
-
 Show what the same command would change, without copying anything:
 
 ```sh
